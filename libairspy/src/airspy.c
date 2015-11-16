@@ -27,7 +27,8 @@ ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSI
 #include <stdlib.h>
 #include <string.h>
 #include <libusb.h>
-#include <pthread.h>
+#undef inline
+#include <thr/threads.h>
 
 #include "airspy.h"
 #include "iqconverter_float.h"
@@ -73,10 +74,10 @@ typedef struct airspy_device
 	airspy_sample_block_cb_fn callback;
 	volatile bool streaming;
 	volatile bool stop_requested;
-	pthread_t transfer_thread;
-	pthread_t conversion_thread;
-	pthread_cond_t conversion_cv;
-	pthread_mutex_t conversion_mp;
+	thrd_t transfer_thread;
+	thrd_t conversion_thread;
+	cnd_t conversion_cv;
+	mtx_t conversion_mp;
 	uint32_t transfer_count;
 	uint32_t buffer_size;
 	uint32_t total_dropped_samples;	
@@ -318,7 +319,7 @@ static inline void unpack_samples(uint32_t *input, uint16_t *output, int length)
 	}
 }
 
-static void* conversion_threadproc(void *arg)
+static int conversion_threadproc(void *arg)
 {
 	int sample_count;
 	uint16_t* input_samples;
@@ -335,15 +336,15 @@ static void* conversion_threadproc(void *arg)
 	{
 		if (device->received_samples_queue_head == device->received_samples_queue_tail)
 		{
-			pthread_mutex_lock(&device->conversion_mp);
+			mtx_lock(&device->conversion_mp);
 			device->converter_is_waiting = true;
 			while (device->received_samples_queue_head == device->received_samples_queue_tail &&
 				!device->stop_requested && device->streaming)
 			{
-				pthread_cond_wait(&device->conversion_cv, &device->conversion_mp);
+				cnd_wait(&device->conversion_cv, &device->conversion_mp);
 			}
 			device->converter_is_waiting = false;
-			pthread_mutex_unlock(&device->conversion_mp);
+			mtx_unlock(&device->conversion_mp);
 
 			if (device->stop_requested || !device->streaming)
 			{
@@ -414,7 +415,7 @@ static void* conversion_threadproc(void *arg)
 		device->received_samples_queue_tail = (device->received_samples_queue_tail + 1) & (RAW_BUFFER_COUNT - 1);
 	}
 
-	return NULL;
+	return 0;
 }
 
 static void airspy_libusb_transfer_callback(struct libusb_transfer* usb_transfer)
@@ -438,9 +439,9 @@ static void airspy_libusb_transfer_callback(struct libusb_transfer* usb_transfer
 
 			if (device->converter_is_waiting)
 			{
-				pthread_mutex_lock(&device->conversion_mp);
-				pthread_cond_signal(&device->conversion_cv);
-				pthread_mutex_unlock(&device->conversion_mp);
+				mtx_lock(&device->conversion_mp);
+				cnd_signal(&device->conversion_cv);
+				mtx_unlock(&device->conversion_mp);
 			}
 		}
 	}
@@ -451,7 +452,7 @@ static void airspy_libusb_transfer_callback(struct libusb_transfer* usb_transfer
 	}
 }
 
-static void* transfer_threadproc(void* arg)
+static int transfer_threadproc(void* arg)
 {
 	airspy_device_t* device = (airspy_device_t*)arg;
 	int error;
@@ -473,7 +474,7 @@ static void* transfer_threadproc(void* arg)
 		}
 	}
 
-	return NULL;
+	return 0;
 }
 
 static int kill_io_threads(airspy_device_t* device)
@@ -483,10 +484,10 @@ static int kill_io_threads(airspy_device_t* device)
 		device->stop_requested = true;
 		cancel_transfers(device);
 
-		pthread_cond_signal(&device->conversion_cv);
+		cnd_signal(&device->conversion_cv);
 
-		pthread_join(device->transfer_thread, NULL);
-		pthread_join(device->conversion_thread, NULL);
+		thrd_join(device->transfer_thread, NULL);
+		thrd_join(device->conversion_thread, NULL);
 
 		device->stop_requested = false;
 		device->streaming = false;
@@ -498,7 +499,6 @@ static int kill_io_threads(airspy_device_t* device)
 static int create_io_threads(airspy_device_t* device, airspy_sample_block_cb_fn callback)
 {
 	int result;
-	pthread_attr_t attr;
 
 	if (!device->streaming && !device->stop_requested)
 	{
@@ -515,22 +515,17 @@ static int create_io_threads(airspy_device_t* device, airspy_sample_block_cb_fn 
 		device->received_samples_queue_tail = 0;
 		device->converter_is_waiting = true;
 
-		pthread_attr_init(&attr);
-		pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_JOINABLE);
-
-		result = pthread_create(&device->conversion_thread, &attr, conversion_threadproc, device);
+		result = thrd_create(&device->conversion_thread, conversion_threadproc, device);
 		if (result != 0)
 		{
 			return AIRSPY_ERROR_THREAD;
 		}
 
-		result = pthread_create(&device->transfer_thread, &attr, transfer_threadproc, device);
+		result = thrd_create(&device->transfer_thread, transfer_threadproc, device);
 		if (result != 0)
 		{
 			return AIRSPY_ERROR_THREAD;
 		}
-
-		pthread_attr_destroy(&attr);
 	}
 	else {
 		return AIRSPY_ERROR_BUSY;
@@ -771,8 +766,8 @@ static int airspy_open_init(airspy_device_t** device, uint64_t serial_number)
 	lib_device->cnv_f = iqconverter_float_create(HB_KERNEL_FLOAT, HB_KERNEL_FLOAT_LEN);
 	lib_device->cnv_i = iqconverter_int16_create(HB_KERNEL_INT16, HB_KERNEL_INT16_LEN);
 
-	pthread_cond_init(&lib_device->conversion_cv, NULL);
-	pthread_mutex_init(&lib_device->conversion_mp, NULL);
+	cnd_init(&lib_device->conversion_cv);
+	mtx_init(&lib_device->conversion_mp, mtx_plain);
 
 	*device = lib_device;
 
@@ -832,8 +827,8 @@ extern "C"
 			iqconverter_float_free(device->cnv_f);
 			iqconverter_int16_free(device->cnv_i);
 
-			pthread_cond_destroy(&device->conversion_cv);
-			pthread_mutex_destroy(&device->conversion_mp);
+			cnd_destroy(&device->conversion_cv);
+			mtx_destroy(&device->conversion_mp);
 
 			airspy_open_exit(device);
 			free_transfers(device);
@@ -854,7 +849,7 @@ extern "C"
 			0,
 			len,
 			(unsigned char*) buffer,
-			(len > 0 ? len : 1) * sizeof(uint32_t),
+			(uint16_t)((len > 0 ? len : 1) * sizeof(uint32_t)),
 			0);
 
 		if (result < 1)
