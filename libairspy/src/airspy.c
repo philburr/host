@@ -302,7 +302,7 @@ static void convert_samples_float(uint16_t *src, float *dest, int count)
 	}
 }
 
-static inline void unpack_samples(uint32_t *input, uint16_t *output, int length)
+static _inline void unpack_samples(uint32_t *input, uint16_t *output, int length)
 {
 	int i, j;
 
